@@ -22,6 +22,14 @@ public sealed partial class ChatUIController : IOnSystemChanged<CharacterInfoSys
     private static readonly Regex StartDoubleQuote = new("\"$");
     private static readonly Regex EndDoubleQuote = new("^\"|(?<=^@)\"");
     private static readonly Regex StartAtSign = new("^@");
+    private static readonly Regex ParenthesesRegex = new(@"\s*\([^)]*\)");
+
+    private const int MinNamePartHighlightLength = 2;
+
+    private static readonly HashSet<string> IgnoredNameParts = new()
+    {
+        "the", "of", "and", "a", "an", "in", "on", "at", "to", "for", "by", "with", "from", "as"
+    };
 
     /// <summary>
     ///     The list of words to be highlighted in the chatbox.
@@ -34,6 +42,7 @@ public sealed partial class ChatUIController : IOnSystemChanged<CharacterInfoSys
     private string? _highlightsColor;
 
     private bool _autoFillHighlightsEnabled;
+    private string _autoHighlights = "";
 
     /// <summary>
     ///     The boolean that keeps track of the 'OnCharacterUpdated' event, whenever it's a player attaching or opening the character info panel.
@@ -44,7 +53,14 @@ public sealed partial class ChatUIController : IOnSystemChanged<CharacterInfoSys
 
     private void InitializeHighlights()
     {
-        _config.OnValueChanged(CCVars.ChatAutoFillHighlights, (value) => { _autoFillHighlightsEnabled = value; }, true);
+        _config.OnValueChanged(CCVars.ChatAutoFillHighlights, (value) =>
+        {
+            _autoFillHighlightsEnabled = value;
+            if (value)
+                UpdateAutoFillHighlights();
+            else
+                ReloadHighlights();
+        }, true);
 
         _config.OnValueChanged(CCVars.ChatHighlightsColor, (value) => { _highlightsColor = value; }, true);
 
@@ -77,7 +93,7 @@ public sealed partial class ChatUIController : IOnSystemChanged<CharacterInfoSys
         // If auto highlights are enabled generate a request for new character info
         // that will be used to determine the highlights.
         _charInfoIsAttach = true;
-        _characterInfo.RequestCharacterInfo();
+        _characterInfo?.RequestCharacterInfo();
     }
 
     public void UpdateHighlights(string newHighlights, bool firstLoad = false)
@@ -89,11 +105,26 @@ public sealed partial class ChatUIController : IOnSystemChanged<CharacterInfoSys
         _config.SetCVar(CCVars.ChatHighlights, newHighlights);
         _config.SaveToFile();
 
+        ReloadHighlights();
+        HighlightsUpdated?.Invoke(newHighlights);
+    }
+
+    public void ReloadHighlights()
+    {
         _highlights.Clear();
+
+        var combined = _config.GetCVar(CCVars.ChatHighlights);
+        if (_autoFillHighlightsEnabled && !string.IsNullOrEmpty(_autoHighlights))
+        {
+            if (string.IsNullOrEmpty(combined))
+                combined = _autoHighlights;
+            else
+                combined += "\n" + _autoHighlights;
+        }
 
         // We first subdivide the highlights based on newlines to prevent replacing
         // a valid "\n" tag and adding it to the final regex.
-        var splittedHighlights = newHighlights.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var splittedHighlights = combined.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
         for (var i = 0; i < splittedHighlights.Length; i++)
         {
@@ -142,17 +173,47 @@ public sealed partial class ChatUIController : IOnSystemChanged<CharacterInfoSys
 
         var (_, job, _, _, entityName) = data;
 
-        // Mark this entity's name as our character name for the "UpdateHighlights" function.
-        var newHighlights = "@" + entityName;
+        var cleanName = ParenthesesRegex.Replace(entityName, "").Trim();
+        var nameParts = new List<string>();
 
-        // Subdivide the character's name based on spaces or hyphens so that every word gets highlighted.
-        if (newHighlights.Count(c => (c == ' ' || c == '-')) == 1)
-            newHighlights = newHighlights.Replace("-", "\n@").Replace(" ", "\n@");
+        if (cleanName.Length >= MinNamePartHighlightLength)
+        {
+            nameParts.Add(cleanName);
 
-        // If the character has a name with more than one hyphen assume it is a lizard name and extract the first and
-        // last name eg. "Eats-The-Food" -> "@Eats" "@Food"
-        if (newHighlights.Count(c => c == '-') > 1)
-            newHighlights = newHighlights.Split('-')[0] + "\n@" + newHighlights.Split('-')[^1];
+            void AddPart(string part)
+            {
+                var trimmedPart = part.Trim().Trim('"');
+                if (trimmedPart.Length >= MinNamePartHighlightLength &&
+                    !trimmedPart.All(char.IsDigit) &&
+                    !IgnoredNameParts.Contains(trimmedPart.ToLowerInvariant()))
+                {
+                    nameParts.Add(trimmedPart);
+                }
+            }
+
+            // Subdivide the name based on spaces
+            if (cleanName.Contains(' '))
+            {
+                foreach (var part in cleanName.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    AddPart(part);
+                }
+            }
+            // If the character has one or more hyphens, split them and extract the first and last components (e.g., "Eats-Food" -> "Eats", "Food")
+            else if (cleanName.Contains('-'))
+            {
+                var split = cleanName.Split('-', StringSplitOptions.RemoveEmptyEntries);
+                if (split.Length > 0)
+                {
+                    AddPart(split[0]);
+                    if (split.Length > 1)
+                        AddPart(split[^1]);
+                }
+            }
+        }
+
+        // Wrap each name part in @ and double quotes to ensure whole-word matching and prevent single characters from matching substrings (e.g. "@B" -> "@"B"").
+        var newHighlights = string.Join("\n", nameParts.Select(part => $"@\"{part}\""));
 
         // Convert the job title to kebab-case and use it as a key for the loc file.
         var jobKey = job.Replace(' ', '-').ToLower();
@@ -160,8 +221,8 @@ public sealed partial class ChatUIController : IOnSystemChanged<CharacterInfoSys
         if (_loc.TryGetString($"highlights-{jobKey}", out var jobMatches))
             newHighlights += '\n' + jobMatches.Replace(", ", "\n");
 
-        UpdateHighlights(newHighlights);
-        HighlightsUpdated?.Invoke(newHighlights);
+        _autoHighlights = newHighlights;
+        ReloadHighlights();
         _charInfoIsAttach = false;
     }
 }
